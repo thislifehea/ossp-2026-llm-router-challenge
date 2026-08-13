@@ -17,6 +17,7 @@
 .ruff_cache/
 .venv/
 /.venv-data/
+/.venv-embed/
 __pycache__/
 build/
 /data/cache/

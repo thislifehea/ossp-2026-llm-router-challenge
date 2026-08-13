@@ -2227,7 +2227,7 @@
   },
   "tier_safety_ratios": {
     "balanced": 0.9708333333333333,
-    "fast": 0.9733333333333334,
+    "fast": 0.9538666666666668,
     "premium": 0.94375
   },
   "training_summary": {
