@@ -52,14 +52,21 @@ MIN_HASH_BINS = 16
 MAX_HASH_BINS = 16_384
 PREMIUM_AX31_FILL_SAFETY_RATIO = 0.65
 
-# Calibrated on the public Dev split (EXPERIMENTS.md 실험N, 2026-08-18) via a
-# joint (quantile alpha x safety-ratio) grid search against the official
-# self-check harness. Not part of any trained artifact because they are
+# Calibrated on the public Dev split (EXPERIMENTS.md 실험Q, 2026-08-19) with a
+# *robustness-first* search: instead of picking whatever passes the official
+# self-check on the full 880-episode Dev batch, each candidate safety_ratio
+# was additionally required to keep the tier's budget under cap on 10
+# independently-reshuffled ~440-episode halves of Dev before its Dev-880
+# tier_score was even considered. 실험N's ratios (fast=0.99/balanced=0.975/
+# premium=1.0) scored higher on Dev-880 itself but failed budget on more
+# than half of those resampled halves (balanced/premium especially) --
+# i.e. they were fit to this exact 880-episode sample, not to the tier's
+# true cost distribution. Not part of any trained artifact because they are
 # properties of the *routing policy*, not of a single model.
 _TIER_SAFETY_RATIOS: Mapping[str, float] = {
-    "fast": 0.99,
-    "balanced": 0.975,
-    "premium": 1.0,
+    "fast": 0.985,
+    "balanced": 0.9125,
+    "premium": 0.85,
 }
 
 # Which trained quantile level (see resources/quantile-gbm-cost.v1.json) each
@@ -519,15 +526,92 @@ def _parse_quantile_cost_artifact(value: Any) -> QuantileCostArtifact:
     )
 
 
-def _predict_quantile_cost(
+def _gbm_quantile_cost(
     episode: Episode, artifact: QuantileCostArtifact, alpha_key: str
 ) -> Mapping[str, float]:
     raw = raw_feature_vector(episode, artifact.hash_bins)
     heads = artifact.alpha_heads[alpha_key]
-    costs = {
+    return {
         model_id: math.exp(min(50.0, max(-50.0, _gbm_predict(heads[model_id], raw))))
         for model_id in MODEL_IDS
     }
+
+
+# === linear quantile-regression cost artifact (실험P/Q: ensembled with the
+# GBM quantile head the same way K ensembled ridge+GBM for score) ===
+
+
+@dataclass(frozen=True)
+class QuantileRidgeCostArtifact:
+    feature_mean: Tuple[float, ...]
+    feature_scale: Tuple[float, ...]
+    alpha_heads: Mapping[str, Mapping[str, LinearHead]]
+    policy_id: str
+    policy_digest: str
+
+
+def _parse_quantile_ridge_cost_artifact(value: Any) -> QuantileRidgeCostArtifact:
+    root = _object(value, "quantile ridge cost artifact")
+    if root["artifact_type"] != "ossp-quantile-ridge-cost-v1":
+        raise ProtocolError("지원하지 않는 quantile ridge cost artifact_type입니다.")
+    hash_bins = _integer(root["hash_bins"], "artifact.hash_bins", MIN_HASH_BINS, MAX_HASH_BINS)
+    length = len(DENSE_FEATURE_NAMES) + hash_bins
+    mean = _vector(root["feature_mean"], length, "artifact.feature_mean")
+    scale = _vector(root["feature_scale"], length, "artifact.feature_scale")
+    if any(item <= 0 for item in scale):
+        raise ProtocolError("artifact.feature_scale은 모두 0보다 커야 합니다.")
+    alpha_raw = _object(root["alpha_heads"], "artifact.alpha_heads")
+    alpha_heads = {}
+    for alpha_key, heads_value in alpha_raw.items():
+        heads_raw = _object(heads_value, f"alpha_heads.{alpha_key}")
+        if set(heads_raw) != set(MODEL_IDS):
+            raise ProtocolError(f"alpha_heads.{alpha_key}의 모델 집합이 올바르지 않습니다.")
+        alpha_heads[alpha_key] = {
+            model_id: LinearHead(
+                intercept=_number(
+                    heads_raw[model_id]["intercept"], f"alpha_heads.{alpha_key}.{model_id}.intercept"
+                ),
+                coefficients=_vector(
+                    heads_raw[model_id]["coefficients"], length, f"alpha_heads.{alpha_key}.{model_id}.coefficients"
+                ),
+            )
+            for model_id in MODEL_IDS
+        }
+    return QuantileRidgeCostArtifact(
+        feature_mean=mean,
+        feature_scale=scale,
+        alpha_heads=alpha_heads,
+        policy_id=root["policy_id"],
+        policy_digest=root["policy_sha256"],
+    )
+
+
+def _ridge_quantile_cost(
+    episode: Episode, artifact: QuantileRidgeCostArtifact, alpha_key: str
+) -> Mapping[str, float]:
+    raw = raw_feature_vector(episode, len(artifact.feature_mean) - len(DENSE_FEATURE_NAMES))
+    standardized = tuple(
+        (value - mean) / scale
+        for value, mean, scale in zip(raw, artifact.feature_mean, artifact.feature_scale)
+    )
+    heads = artifact.alpha_heads[alpha_key]
+    return {
+        model_id: math.exp(min(50.0, max(-50.0, _linear(heads[model_id], standardized))))
+        for model_id in MODEL_IDS
+    }
+
+
+def _predict_quantile_cost(
+    episode: Episode,
+    gbm_artifact: QuantileCostArtifact,
+    ridge_artifact: QuantileRidgeCostArtifact,
+    alpha_key: str,
+) -> Mapping[str, float]:
+    """Mean-ensemble of the GBM and linear quantile cost predictors (실험Q)."""
+
+    g_costs = _gbm_quantile_cost(episode, gbm_artifact, alpha_key)
+    r_costs = _ridge_quantile_cost(episode, ridge_artifact, alpha_key)
+    costs = {m: (g_costs[m] + r_costs[m]) / 2.0 for m in MODEL_IDS}
     light = costs[MODEL_IDS[0]]
     costs[MODEL_IDS[1]] = max(costs[MODEL_IDS[1]], light * (1.0 + 1e-12))
     costs[MODEL_IDS[2]] = max(costs[MODEL_IDS[2]], costs[MODEL_IDS[1]] * (1.0 + 1e-12))
@@ -651,6 +735,7 @@ def fill_ax31_upgrades(
 _ridge_artifact_cache: RidgeArtifact | None = None
 _gbm_artifact_cache: GbmArtifact | None = None
 _quantile_cost_artifact_cache: QuantileCostArtifact | None = None
+_quantile_ridge_cost_artifact_cache: QuantileRidgeCostArtifact | None = None
 
 
 def _load_bundled_ridge_artifact() -> RidgeArtifact:
@@ -698,9 +783,25 @@ def _load_bundled_quantile_cost_artifact() -> QuantileCostArtifact:
     return _quantile_cost_artifact_cache
 
 
+def _load_bundled_quantile_ridge_cost_artifact() -> QuantileRidgeCostArtifact:
+    global _quantile_ridge_cost_artifact_cache
+    if _quantile_ridge_cost_artifact_cache is None:
+        try:
+            text = resources.read_text(
+                "ossp_router.resources",
+                "quantile-ridge-cost.v1.json",
+                encoding="utf-8",
+            )
+        except (OSError, UnicodeError) as exc:
+            raise ProtocolError(f"내장 quantile ridge cost artifact를 읽을 수 없습니다: {exc}") from exc
+        _quantile_ridge_cost_artifact_cache = _parse_quantile_ridge_cost_artifact(loads_json(text))
+    return _quantile_ridge_cost_artifact_cache
+
+
 def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Submission:
-    """Route one tier with the adopted policy (EXPERIMENTS.md 실험N): ridge+GBM
-    ensemble score head, tier-specific quantile-GBM cost head."""
+    """Route one tier with the adopted policy (EXPERIMENTS.md 실험Q): ridge+GBM
+    ensemble score head, tier-specific (GBM quantile + linear quantile) mean-
+    ensembled cost head, robustness-validated safety_ratio per tier."""
 
     if inputs.schema_version != policy.schema_version:
         raise ProtocolError("입력과 정책의 schema_version이 일치하지 않습니다.")
@@ -709,11 +810,18 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
 
     ridge_artifact = _load_bundled_ridge_artifact()
     gbm_artifact = _load_bundled_gbm_artifact()
-    quantile_artifact = _load_bundled_quantile_cost_artifact()
+    quantile_gbm_artifact = _load_bundled_quantile_cost_artifact()
+    quantile_ridge_artifact = _load_bundled_quantile_ridge_cost_artifact()
     _check_policy_binding(ridge_artifact.policy_id, ridge_artifact.policy_digest, policy, "ridge artifact")
     _check_policy_binding(gbm_artifact.policy_id, gbm_artifact.policy_digest, policy, "gbm artifact")
     _check_policy_binding(
-        quantile_artifact.policy_id, quantile_artifact.policy_digest, policy, "quantile cost artifact"
+        quantile_gbm_artifact.policy_id, quantile_gbm_artifact.policy_digest, policy, "quantile gbm cost artifact"
+    )
+    _check_policy_binding(
+        quantile_ridge_artifact.policy_id,
+        quantile_ridge_artifact.policy_digest,
+        policy,
+        "quantile ridge cost artifact",
     )
 
     alpha_key = _TIER_COST_QUANTILE[tier]
@@ -721,7 +829,8 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
         _predict_ensemble_score(episode, ridge_artifact, gbm_artifact) for episode in inputs.episodes
     ]
     costs = [
-        _predict_quantile_cost(episode, quantile_artifact, alpha_key) for episode in inputs.episodes
+        _predict_quantile_cost(episode, quantile_gbm_artifact, quantile_ridge_artifact, alpha_key)
+        for episode in inputs.episodes
     ]
     safety = _TIER_SAFETY_RATIOS[tier]
     selected, _ratio = select_models(

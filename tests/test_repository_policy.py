@@ -656,6 +656,7 @@ class RepositoryPolicyTest(unittest.TestCase):
             "!src/ossp_router/resources/hash-regex-bins256-alpha1000.v1.json",
             "!src/ossp_router/resources/gbm.v1.json",
             "!src/ossp_router/resources/quantile-gbm-cost.v1.json",
+            "!src/ossp_router/resources/quantile-ridge-cost.v1.json",
             "!baselines/",
             "baselines/**",
             "!baselines/feature_budget.py",
