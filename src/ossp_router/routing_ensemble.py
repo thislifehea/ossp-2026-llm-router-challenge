@@ -52,20 +52,23 @@ MIN_HASH_BINS = 16
 MAX_HASH_BINS = 16_384
 AX31_FILL_SAFETY_RATIO = 0.65
 
-# Calibrated on the public Dev split (EXPERIMENTS.md 실험Q, 2026-08-19) with a
-# *robustness-first* search: instead of picking whatever passes the official
-# self-check on the full 880-episode Dev batch, each candidate safety_ratio
-# was additionally required to keep the tier's budget under cap on 10
-# independently-reshuffled ~440-episode halves of Dev before its Dev-880
-# tier_score was even considered. 실험N's ratios (fast=0.99/balanced=0.975/
-# premium=1.0) scored higher on Dev-880 itself but failed budget on more
-# than half of those resampled halves (balanced/premium especially) --
-# i.e. they were fit to this exact 880-episode sample, not to the tier's
-# true cost distribution. Not part of any trained artifact because they are
-# properties of the *routing policy*, not of a single model.
+# Calibrated on the public Dev split with a *robustness-first* search:
+# instead of picking whatever passes the official self-check on the full
+# 880-episode Dev batch, each candidate safety_ratio was additionally
+# required to keep the tier's budget under cap on 10 independently-
+# reshuffled ~440-episode halves of Dev before its Dev-880 tier_score was
+# even considered (실험Q, 2026-08-19; 실험N's looser ratios scored higher on
+# Dev-880 itself but failed budget on resampled halves).
+#
+# 실험DD(2026-08-20)에서 fast/balanced의 score 앙상블이 릿지+GBM에서
+# 릿지+이항GLM으로 바뀌면서, Q 시절 값(fast=0.985/balanced=0.9125)을 그대로
+# 쓰면 10/10 리샘플 검증을 통과하지 못한다는 게 확인됨(9/10, 9/10) -- 새
+# score 모델에 맞춰 fast/balanced를 재탐색, premium은 score 앙상블이 안
+# 바뀌었으므로 그대로 유지. Not part of any trained artifact because they
+# are properties of the *routing policy*, not of a single model.
 _TIER_SAFETY_RATIOS: Mapping[str, float] = {
-    "fast": 0.985,
-    "balanced": 0.9125,
+    "fast": 0.98,
+    "balanced": 0.90,
     "premium": 0.85,
 }
 
@@ -473,15 +476,90 @@ def _predict_gbm(
     return scores, costs
 
 
+# === binomial GLM score artifact (실험DD: score is k/n successes over
+# num_generations trials, not an arbitrary continuous value -- a logistic-link
+# head trained on the expanded per-trial Bernoulli outcomes gives n=4
+# observations proportionally more weight than n=2 ones, unlike a plain MSE
+# regression that treats every score value as equally reliable) ===
+
+
+@dataclass(frozen=True)
+class BinomialGlmArtifact:
+    feature_mean: Tuple[float, ...]
+    feature_scale: Tuple[float, ...]
+    score_heads: Mapping[str, LinearHead]
+    policy_id: str
+    policy_digest: str
+
+
+def _parse_binomial_glm_artifact(value: Any) -> BinomialGlmArtifact:
+    root = _object(value, "binomial glm artifact")
+    if root["artifact_type"] != "ossp-binomial-glm-score-v1":
+        raise ProtocolError("지원하지 않는 binomial glm artifact_type입니다.")
+    hash_bins = _integer(root["hash_bins"], "artifact.hash_bins", MIN_HASH_BINS, MAX_HASH_BINS)
+    if hash_bins & (hash_bins - 1):
+        raise ProtocolError("artifact.hash_bins는 2의 거듭제곱이어야 합니다.")
+    if tuple(root["dense_feature_names"]) != DENSE_FEATURE_NAMES:
+        raise ProtocolError("dense feature 정의가 현재 런타임과 다릅니다.")
+    if tuple(root["model_ids"]) != MODEL_IDS:
+        raise ProtocolError("artifact.model_ids가 공개 정책 모델과 다릅니다.")
+    length = len(DENSE_FEATURE_NAMES) + hash_bins
+    mean = _vector(root["feature_mean"], length, "artifact.feature_mean")
+    scale = _vector(root["feature_scale"], length, "artifact.feature_scale")
+    if any(item <= 0 for item in scale):
+        raise ProtocolError("artifact.feature_scale은 모두 0보다 커야 합니다.")
+    score_raw = _object(root["score_heads"], "artifact.score_heads")
+    return BinomialGlmArtifact(
+        feature_mean=mean,
+        feature_scale=scale,
+        score_heads={
+            model_id: _parse_linear_head(score_raw[model_id], length, f"score_heads.{model_id}")
+            for model_id in MODEL_IDS
+        },
+        policy_id=root["policy_id"],
+        policy_digest=root["policy_sha256"],
+    )
+
+
+def _predict_binomial_glm_score(
+    episode: Episode, artifact: BinomialGlmArtifact
+) -> Mapping[str, float]:
+    raw = raw_feature_vector(episode, len(artifact.feature_mean) - len(DENSE_FEATURE_NAMES))
+    standardized = tuple(
+        (value - mean) / scale
+        for value, mean, scale in zip(raw, artifact.feature_mean, artifact.feature_scale)
+    )
+    scores = {}
+    for model_id in MODEL_IDS:
+        z = _linear(artifact.score_heads[model_id], standardized)
+        scores[model_id] = 1.0 / (1.0 + math.exp(-max(-500.0, min(500.0, z))))
+    return scores
+
+
 # === ensemble prediction ===
 
 
 def _predict_ensemble_score(
-    episode: Episode, ridge_artifact: RidgeArtifact, gbm_artifact: GbmArtifact
+    episode: Episode,
+    ridge_artifact: RidgeArtifact,
+    gbm_artifact: GbmArtifact,
+    binomial_glm_artifact: BinomialGlmArtifact,
+    tier: str,
 ) -> Mapping[str, float]:
+    """실험DD(2026-08-20): 로버스트니스 우선 검증으로 fast/balanced는
+    릿지+이항GLM 블렌드가, premium은 기존 릿지+GBM 블렌드(실험K)가 각각
+    더 낫다는 게 확인됨 -- score(성공비율)는 num_generations번 시행의
+    이항분포 관측치라, MSE로 학습한 릿지/GBM과 로지스틱 링크로 학습한
+    이항GLM은 서로 다른 종류의 오차를 범한다. premium처럼 light/think
+    격차가 극단적인 결정에서는 GBM 쪽이, fast/balanced처럼 애매한 경계
+    판단이 많은 곳에서는 이항GLM 쪽이 우위를 보임."""
+
     r_scores, _r_costs = _predict_ridge(episode, ridge_artifact)
-    g_scores, _g_costs = _predict_gbm(episode, gbm_artifact)
-    return {m: (r_scores[m] + g_scores[m]) / 2.0 for m in MODEL_IDS}
+    if tier == "premium":
+        g_scores, _g_costs = _predict_gbm(episode, gbm_artifact)
+        return {m: (r_scores[m] + g_scores[m]) / 2.0 for m in MODEL_IDS}
+    b_scores = _predict_binomial_glm_score(episode, binomial_glm_artifact)
+    return {m: (r_scores[m] + b_scores[m]) / 2.0 for m in MODEL_IDS}
 
 
 # === quantile cost artifact (실험N: per-tier high-percentile cost head) ===
@@ -736,6 +814,7 @@ _ridge_artifact_cache: RidgeArtifact | None = None
 _gbm_artifact_cache: GbmArtifact | None = None
 _quantile_cost_artifact_cache: QuantileCostArtifact | None = None
 _quantile_ridge_cost_artifact_cache: QuantileRidgeCostArtifact | None = None
+_binomial_glm_artifact_cache: BinomialGlmArtifact | None = None
 
 
 def _load_bundled_ridge_artifact() -> RidgeArtifact:
@@ -798,10 +877,27 @@ def _load_bundled_quantile_ridge_cost_artifact() -> QuantileRidgeCostArtifact:
     return _quantile_ridge_cost_artifact_cache
 
 
+def _load_bundled_binomial_glm_artifact() -> BinomialGlmArtifact:
+    global _binomial_glm_artifact_cache
+    if _binomial_glm_artifact_cache is None:
+        try:
+            text = resources.read_text(
+                "ossp_router.resources",
+                "binomial-glm-score.v1.json",
+                encoding="utf-8",
+            )
+        except (OSError, UnicodeError) as exc:
+            raise ProtocolError(f"내장 binomial glm artifact를 읽을 수 없습니다: {exc}") from exc
+        _binomial_glm_artifact_cache = _parse_binomial_glm_artifact(loads_json(text))
+    return _binomial_glm_artifact_cache
+
+
 def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Submission:
-    """Route one tier with the adopted policy (EXPERIMENTS.md 실험Q): ridge+GBM
-    ensemble score head, tier-specific (GBM quantile + linear quantile) mean-
-    ensembled cost head, robustness-validated safety_ratio per tier."""
+    """Route one tier with the adopted policy (EXPERIMENTS.md 실험DD): score
+    head is ridge+binomial-GLM for fast/balanced and ridge+GBM (실험K) for
+    premium (tier-specific, robustness-validated); cost head is tier-specific
+    (GBM quantile + linear quantile) mean-ensembled (실험Q), safety_ratio is
+    robustness-validated per tier."""
 
     if inputs.schema_version != policy.schema_version:
         raise ProtocolError("입력과 정책의 schema_version이 일치하지 않습니다.")
@@ -812,6 +908,7 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
     gbm_artifact = _load_bundled_gbm_artifact()
     quantile_gbm_artifact = _load_bundled_quantile_cost_artifact()
     quantile_ridge_artifact = _load_bundled_quantile_ridge_cost_artifact()
+    binomial_glm_artifact = _load_bundled_binomial_glm_artifact()
     _check_policy_binding(ridge_artifact.policy_id, ridge_artifact.policy_digest, policy, "ridge artifact")
     _check_policy_binding(gbm_artifact.policy_id, gbm_artifact.policy_digest, policy, "gbm artifact")
     _check_policy_binding(
@@ -823,10 +920,17 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
         policy,
         "quantile ridge cost artifact",
     )
+    _check_policy_binding(
+        binomial_glm_artifact.policy_id,
+        binomial_glm_artifact.policy_digest,
+        policy,
+        "binomial glm artifact",
+    )
 
     alpha_key = _TIER_COST_QUANTILE[tier]
     scores = [
-        _predict_ensemble_score(episode, ridge_artifact, gbm_artifact) for episode in inputs.episodes
+        _predict_ensemble_score(episode, ridge_artifact, gbm_artifact, binomial_glm_artifact, tier)
+        for episode in inputs.episodes
     ]
     costs = [
         _predict_quantile_cost(episode, quantile_gbm_artifact, quantile_ridge_artifact, alpha_key)
