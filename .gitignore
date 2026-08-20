@@ -18,6 +18,7 @@
 .venv/
 /.venv-data/
 /.venv-embed/
+/.venv-wsl-embed/
 __pycache__/
 build/
 /data/cache/
