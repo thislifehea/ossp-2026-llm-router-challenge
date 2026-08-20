@@ -50,7 +50,7 @@ from .protocol import (
 FEATURE_VERSION = 1
 MIN_HASH_BINS = 16
 MAX_HASH_BINS = 16_384
-PREMIUM_AX31_FILL_SAFETY_RATIO = 0.65
+AX31_FILL_SAFETY_RATIO = 0.65
 
 # Calibrated on the public Dev split (EXPERIMENTS.md 실험Q, 2026-08-19) with a
 # *robustness-first* search: instead of picking whatever passes the official
@@ -839,14 +839,19 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
         budget_multiplier=float(policy.tiers[tier].budget_multiplier),
         safety_ratio=safety,
     )
-    if tier == "premium":
-        selected, _ratio = fill_ax31_upgrades(
-            selected,
-            scores,
-            costs,
-            budget_multiplier=float(policy.tiers[tier].budget_multiplier),
-            safety_ratio=PREMIUM_AX31_FILL_SAFETY_RATIO,
-        )
+    # 실험CC(2026-08-20): 라그랑주 이분탐색은 캡에 살짝 못 미치는 미세한
+    # 여유를 남길 수 있다(이산적 argmax 결정이라 mu가 연속적으로 캡에
+    # 수렴하지 못함) -- 이 fill 패스는 그 여유를 light->ax31 업그레이드로
+    # 마저 채운다. 원래 premium에만 적용했지만, 이 여유는 tier 구조상
+    # 어느 tier에나 생길 수 있어 전 tier로 확장(실측 여유는 tier당
+    # 0.02~0.12%로 작지만, 순손실 없는 방어적 개선이라 유지 비용이 없음).
+    selected, _ratio = fill_ax31_upgrades(
+        selected,
+        scores,
+        costs,
+        budget_multiplier=float(policy.tiers[tier].budget_multiplier),
+        safety_ratio=AX31_FILL_SAFETY_RATIO,
+    )
     submission = Submission(
         schema_version=inputs.schema_version,
         challenge_id=inputs.challenge_id,
