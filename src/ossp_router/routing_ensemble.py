@@ -69,21 +69,29 @@ AX31_FILL_SAFETY_RATIO = 0.65
 # 실험LL(2026-08-21)에서 balanced 전용 이항GLM 아티팩트(균일 C=0.001)로
 # 바뀌면서 다시 재탐색 필요 -- DD 시절 값(0.90)을 그대로 두면 10/10 리샘플
 # 검증을 통과 못함, 0.9375로 교체. fast는 아티팩트가 안 바뀌었으므로 그대로
-# 유지. Not part of any trained artifact because they
+# 유지.
+#
+# 실험NN(2026-08-21)에서 premium의 cost quantile alpha가 0.65->0.75로
+# 바뀌면서 premium도 재탐색 필요 -- 0.85를 그대로 두면 최적이 아니어서
+# 0.90625로 교체(10/10 유지). Not part of any trained artifact because they
 # are properties of the *routing policy*, not of a single model.
 _TIER_SAFETY_RATIOS: Mapping[str, float] = {
     "fast": 0.98,
     "balanced": 0.9375,
-    "premium": 0.85,
+    "premium": 0.90625,
 }
 
 # Which trained quantile level (see resources/quantile-gbm-cost.v1.json) each
 # tier's cost head uses -- tighter budgets calibrated to a higher (more
 # conservative) percentile of the cost distribution.
+#
+# 실험NN(2026-08-21): LL로 score 앙상블이 바뀐 뒤 tier별로 다시
+# 로버스트니스 우선 재탐색 -- fast/balanced는 기존 값이 그대로 최적으로
+# 재확인됨, premium만 0.65->0.75가 근소하게 더 나음(+0.0006, 10/10 유지).
 _TIER_COST_QUANTILE: Mapping[str, str] = {
     "fast": "0.75",
     "balanced": "0.65",
-    "premium": "0.65",
+    "premium": "0.75",
 }
 
 _FNV_OFFSET = 14_695_981_039_346_656_037
