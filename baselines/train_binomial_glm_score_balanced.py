@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import hash_regex as hr
 from ossp_router.protocol import MODEL_IDS, load_bundled_policy, load_input, load_outcomes, policy_sha256
-from ossp_router.routing_ensemble import DENSE_FEATURE_NAMES
+from ossp_router.routing_nn import DENSE_FEATURE_NAMES
 
 C = 0.001  # uniform across all three models, robustness-validated for balanced (실험LL)
 HASH_BINS = 256
