@@ -646,7 +646,7 @@ class RepositoryPolicyTest(unittest.TestCase):
             "!src/ossp_router/operator_helper.py",
             "!src/ossp_router/orchestrator.py",
             "!src/ossp_router/protocol.py",
-            "!src/ossp_router/routing_ensemble.py",
+            "!src/ossp_router/routing_nn.py",
             "!src/ossp_router/runtime.py",
             "!src/ossp_router/scoring.py",
             "!src/ossp_router/resources/",

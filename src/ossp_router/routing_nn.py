@@ -1,14 +1,41 @@
 # SPDX-FileCopyrightText: Copyright 2026 SK TELECOM CO., LTD.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Adopted routing policy: ridge (hash+regex) and GBM (hash+regex) mean ensemble.
+"""Adopted routing policy (EXPERIMENTS.md 실험NN, 2026-08-21).
 
-This is the runtime counterpart of the offline experiments recorded as
-EXPERIMENTS.md rows H (ridge), I (GBM) and K (this ensemble). The two trained
-artifacts are bundled read-only in ``ossp_router.resources`` and loaded once
-per process; per-episode routing calls neither model nor any network service.
+Prompt-only content-based router: for each episode, predicts a quality score
+and a cost for all three models from hash+regex features alone, then picks
+one model per episode under a per-tier budget cap (see ``select_models``).
+No model is called at runtime; the six trained artifacts below are bundled
+read-only in ``ossp_router.resources`` and loaded once per process.
 
-Feature extraction and the two per-model prediction heads are ports of
+Score head is tier-specific:
+  - premium: mean of a ridge and a GBM regression (both MSE-trained on the
+    raw [0,1] score) -- premium's decisions hinge on large, often nonlinear
+    quality gaps between models, where the two nonlinear/linear heads
+    complement each other (실험K/실험II/실험JJ).
+  - fast / balanced: mean of the same ridge head and a binomial-GLM
+    (logistic-link) head. outcomes.json's score is not an arbitrary
+    continuous value -- it is k/n, the fraction of ``num_generations``
+    sampled generations that were correct, so a logistic model trained on
+    the expanded per-trial Bernoulli outcomes gives higher-n observations
+    proportionally more weight than an MSE fit does (실험DD). balanced uses
+    its own binomial-GLM artifact (uniform regularization across all three
+    models) rather than fast's, per a tier-specific re-search (실험LL).
+
+Cost head is a mean of a GBM and a linear quantile regression, both trained
+to predict a tier-specific upper quantile of log(cost) rather than its mean
+-- per-episode uncertainty (e.g. axk1-think's volatile output length) is
+baked into the prediction itself (실험N/실험Q/실험NN).
+
+``_TIER_SAFETY_RATIOS`` and ``_TIER_COST_QUANTILE`` were both calibrated with
+a *robustness-first* search: a candidate was only compared on its Dev-880
+score after first confirming it keeps the tier's budget under cap on 10
+independently-reshuffled ~440-episode halves of Dev. Values found by
+maximizing the raw Dev-880 score alone were repeatedly found to be
+overfit to that exact sample (실험P/실험N) and are not used here.
+
+Feature extraction and the ridge/GBM prediction heads are ports of
 ``baselines/hash_regex.py`` and ``baselines/gbm_regex.py`` (kept dependency-free
 of NumPy/scikit-learn on purpose, matching those modules' runtime contract) —
 ``baselines/`` is not shipped in the submission container, so this module does
@@ -52,42 +79,32 @@ MIN_HASH_BINS = 16
 MAX_HASH_BINS = 16_384
 AX31_FILL_SAFETY_RATIO = 0.65
 
-# Calibrated on the public Dev split with a *robustness-first* search:
-# instead of picking whatever passes the official self-check on the full
-# 880-episode Dev batch, each candidate safety_ratio was additionally
-# required to keep the tier's budget under cap on 10 independently-
-# reshuffled ~440-episode halves of Dev before its Dev-880 tier_score was
-# even considered (실험Q, 2026-08-19; 실험N's looser ratios scored higher on
-# Dev-880 itself but failed budget on resampled halves).
+# Per-tier margin below the official budget_multiplier, applied inside
+# select_models as effective_ratio = budget_multiplier * safety_ratio. Not
+# part of any trained artifact -- these are properties of the *routing
+# policy* (how much headroom to leave against prediction error), not of a
+# single model, and must be re-validated with the robustness-first search
+# below whenever a tier's score or cost model changes (EXPERIMENTS.md 실험
+# DD/LL/NN all found that reusing a prior tier's ratio after swapping its
+# model looks fine on the raw Dev-880 score but fails the resampled check).
 #
-# 실험DD(2026-08-20)에서 fast/balanced의 score 앙상블이 릿지+GBM에서
-# 릿지+이항GLM으로 바뀌면서, Q 시절 값(fast=0.985/balanced=0.9125)을 그대로
-# 쓰면 10/10 리샘플 검증을 통과하지 못한다는 게 확인됨(9/10, 9/10) -- 새
-# score 모델에 맞춰 fast/balanced를 재탐색, premium은 score 앙상블이 안
-# 바뀌었으므로 그대로 유지.
-#
-# 실험LL(2026-08-21)에서 balanced 전용 이항GLM 아티팩트(균일 C=0.001)로
-# 바뀌면서 다시 재탐색 필요 -- DD 시절 값(0.90)을 그대로 두면 10/10 리샘플
-# 검증을 통과 못함, 0.9375로 교체. fast는 아티팩트가 안 바뀌었으므로 그대로
-# 유지.
-#
-# 실험NN(2026-08-21)에서 premium의 cost quantile alpha가 0.65->0.75로
-# 바뀌면서 premium도 재탐색 필요 -- 0.85를 그대로 두면 최적이 아니어서
-# 0.90625로 교체(10/10 유지). Not part of any trained artifact because they
-# are properties of the *routing policy*, not of a single model.
+# Calibration method (실험Q, 2026-08-19): a candidate ratio is only compared
+# on its Dev-880 tier_score after first confirming it keeps the tier's
+# budget under cap on 10 independently-reshuffled ~440-episode halves of
+# Dev. Ratios chosen by maximizing the raw Dev-880 score alone were
+# repeatedly found to be overfit to that exact 880-episode sample and to
+# fail budget on resampled halves (실험P/실험N).
 _TIER_SAFETY_RATIOS: Mapping[str, float] = {
     "fast": 0.98,
     "balanced": 0.9375,
     "premium": 0.90625,
 }
 
-# Which trained quantile level (see resources/quantile-gbm-cost.v1.json) each
-# tier's cost head uses -- tighter budgets calibrated to a higher (more
-# conservative) percentile of the cost distribution.
-#
-# 실험NN(2026-08-21): LL로 score 앙상블이 바뀐 뒤 tier별로 다시
-# 로버스트니스 우선 재탐색 -- fast/balanced는 기존 값이 그대로 최적으로
-# 재확인됨, premium만 0.65->0.75가 근소하게 더 나음(+0.0006, 10/10 유지).
+# Which trained quantile level (see resources/quantile-gbm-cost.v1.json and
+# quantile-ridge-cost.v1.json) each tier's cost head uses -- tighter budgets
+# calibrated to a higher (more conservative) percentile of the cost
+# distribution. Re-validated per tier with the same robustness-first search
+# as _TIER_SAFETY_RATIOS whenever a tier's score model changes (실험NN).
 _TIER_COST_QUANTILE: Mapping[str, str] = {
     "fast": "0.75",
     "balanced": "0.65",
@@ -560,19 +577,9 @@ def _predict_ensemble_score(
     binomial_glm_balanced_artifact: BinomialGlmArtifact,
     tier: str,
 ) -> Mapping[str, float]:
-    """실험DD(2026-08-20): 로버스트니스 우선 검증으로 fast/balanced는
-    릿지+이항GLM 블렌드가, premium은 기존 릿지+GBM 블렌드(실험K)가 각각
-    더 낫다는 게 확인됨 -- score(성공비율)는 num_generations번 시행의
-    이항분포 관측치라, MSE로 학습한 릿지/GBM과 로지스틱 링크로 학습한
-    이항GLM은 서로 다른 종류의 오차를 범한다. premium처럼 light/think
-    격차가 극단적인 결정에서는 GBM 쪽이, fast/balanced처럼 애매한 경계
-    판단이 많은 곳에서는 이항GLM 쪽이 우위를 보임.
-
-    실험LL(2026-08-21): DD는 fast/balanced가 이항GLM 아티팩트 하나(모델별
-    C: light=0.001/ax31=0.003/axk1-think=0.003, 로그가능도 CV로 선택)를
-    공유했는데, tier별로 C를 다시 로버스트니스 우선 재탐색하니 balanced는
-    세 모델 모두 C=0.001로 통일한 별도 아티팩트가 더 낫다는 게 확인됨
-    (+0.0011). fast는 기존 혼합-C 아티팩트가 여전히 더 나아서 그대로 유지."""
+    """Tier-specific score ensemble -- see the module docstring for why
+    premium uses ridge+GBM while fast/balanced use ridge+binomial-GLM (and
+    why balanced has its own binomial-GLM artifact rather than fast's)."""
 
     r_scores, _r_costs = _predict_ridge(episode, ridge_artifact)
     if tier == "premium":
@@ -932,12 +939,9 @@ def _load_bundled_binomial_glm_balanced_artifact() -> BinomialGlmArtifact:
 
 
 def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Submission:
-    """Route one tier with the adopted policy (EXPERIMENTS.md 실험LL): score
-    head is ridge+binomial-GLM for fast/balanced (a separate, tier-specific
-    binomial-GLM artifact for balanced -- 실험LL) and ridge+GBM (실험K) for
-    premium (tier-specific, robustness-validated); cost head is tier-specific
-    (GBM quantile + linear quantile) mean-ensembled (실험Q), safety_ratio is
-    robustness-validated per tier."""
+    """Route one tier with the adopted policy -- see the module docstring
+    for the score/cost ensemble design and how safety_ratio/cost quantile
+    were calibrated."""
 
     if inputs.schema_version != policy.schema_version:
         raise ProtocolError("입력과 정책의 schema_version이 일치하지 않습니다.")
@@ -992,12 +996,11 @@ def make_submission(inputs: InputBatch, policy: RoutingPolicy, tier: str) -> Sub
         budget_multiplier=float(policy.tiers[tier].budget_multiplier),
         safety_ratio=safety,
     )
-    # 실험CC(2026-08-20): 라그랑주 이분탐색은 캡에 살짝 못 미치는 미세한
-    # 여유를 남길 수 있다(이산적 argmax 결정이라 mu가 연속적으로 캡에
-    # 수렴하지 못함) -- 이 fill 패스는 그 여유를 light->ax31 업그레이드로
-    # 마저 채운다. 원래 premium에만 적용했지만, 이 여유는 tier 구조상
-    # 어느 tier에나 생길 수 있어 전 tier로 확장(실측 여유는 tier당
-    # 0.02~0.12%로 작지만, 순손실 없는 방어적 개선이라 유지 비용이 없음).
+    # select_models's bisection can leave a sliver of unused budget (its
+    # per-episode decision is discrete, so mu can't converge exactly onto
+    # the cap) -- this pass spends any leftover on light->ax31 upgrades,
+    # applied uniformly to all three tiers since the same slack can occur
+    # in any of them.
     selected, _ratio = fill_ax31_upgrades(
         selected,
         scores,
